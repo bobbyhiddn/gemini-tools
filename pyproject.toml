@@ -1,0 +1,20 @@
+[project]
+name = "gemini-tools-mcp"
+version = "0.1.0"
+description = "MCP server for Gemini AI — image generation and multimodal reasoning"
+requires-python = ">=3.11"
+dependencies = [
+    "google-genai",
+    "httpx",
+    "mcp",
+]
+
+[project.scripts]
+gemini-tools-mcp = "gemini_tools.server:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/gemini_tools"]
