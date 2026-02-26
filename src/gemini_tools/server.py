@@ -9,7 +9,10 @@ from mcp.server import Server
 from mcp.server.stdio import stdio_server
 from mcp.types import Tool, TextContent, ImageContent
 
-from .core import generate_image, oracle_call, load_dotenv, DEFAULT_IMAGE_MODEL, DEFAULT_ORACLE_MODEL
+from .core import (
+    generate_image, oracle_call, load_dotenv,
+    DEFAULT_IMAGE_MODEL, DEFAULT_ORACLE_MODEL, ORACLE_MAX_OUTPUT_TOKENS,
+)
 
 
 # Load environment variables
@@ -121,24 +124,25 @@ async def list_tools() -> list[Tool]:
             name="gemini_oracle",
             description=(
                 "Send a reasoning request to Gemini with optional image and/or large context. "
-                "Returns a text response. Supports up to 1M token context window. "
-                "Use this for multimodal analysis, document reasoning, image understanding, "
-                "or any task requiring Gemini's reasoning capabilities."
+                "Returns a text response. Supports up to 1M token context window and multimodal "
+                "image input (file path or base64). Use this for multimodal analysis, document "
+                "reasoning, image understanding, SVG generation, code review, or any task "
+                "requiring Gemini's deep reasoning with large inputs or outputs."
             ),
             inputSchema={
                 "type": "object",
                 "properties": {
                     "prompt": {
                         "type": "string",
-                        "description": "Text prompt for the reasoning request"
+                        "description": "Text prompt for the reasoning request. No size limit — Gemini 2.5 Pro supports 1M tokens."
                     },
                     "image_path": {
                         "type": "string",
-                        "description": "Optional path to an image file to analyze alongside the prompt"
+                        "description": "Optional path to an image file to analyze alongside the prompt (PNG, JPEG, WEBP, GIF)."
                     },
                     "image_base64": {
                         "type": "string",
-                        "description": "Optional base64-encoded image data (alternative to image_path)"
+                        "description": "Optional base64-encoded image data (alternative to image_path)."
                     },
                     "image_mime_type": {
                         "type": "string",
@@ -147,11 +151,20 @@ async def list_tools() -> list[Tool]:
                     },
                     "context": {
                         "type": "string",
-                        "description": "Additional context text to include before the prompt. Can be very long (up to ~1M tokens)."
+                        "description": "Additional context text prepended before the prompt. Can be very large (up to ~1M tokens) — paste entire codebases, documents, specs, etc."
+                    },
+                    "system_instruction": {
+                        "type": "string",
+                        "description": "Optional system-level instruction to steer the model's behavior (e.g., 'You are an expert SVG designer. Be precise and detailed.')."
+                    },
+                    "max_output_tokens": {
+                        "type": "integer",
+                        "description": f"Maximum tokens in the response (default: {ORACLE_MAX_OUTPUT_TOKENS}). Gemini 2.5 Pro supports up to 65536.",
+                        "default": ORACLE_MAX_OUTPUT_TOKENS
                     },
                     "model": {
                         "type": "string",
-                        "description": f"Gemini model ID to use (default: {DEFAULT_ORACLE_MODEL})",
+                        "description": f"Gemini model ID to use (default: {DEFAULT_ORACLE_MODEL}). Use 'gemini-2.5-pro' for best reasoning, 'gemini-2.5-flash' for speed.",
                         "default": DEFAULT_ORACLE_MODEL
                     }
                 },
@@ -179,20 +192,30 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent | ImageConte
 
 IMAGE GENERATION:
 - {DEFAULT_IMAGE_MODEL} (default for image gen)
-  Latest image generation model
+  Latest image generation model with multimodal input
 
 - gemini-2.5-flash-image
-  Fast image generation
+  Faster image generation
 
-ORACLE REASONING (text responses, up to 1M context):
+ORACLE REASONING (text responses, up to 1M context, 65536 output tokens):
 - {DEFAULT_ORACLE_MODEL} (default for oracle)
-  Gemini 3.1 Pro Preview — 1M token context, multimodal reasoning
+  Gemini 2.5 Pro — 1M token context, best reasoning, multimodal input
+
+- gemini-2.5-flash
+  Fast oracle — 1M token context, good for quick tasks
+
+- gemini-3.1-pro-preview
+  Gemini 3.1 Pro Preview (cutting-edge, may have limited availability)
 
 - gemini-3-flash-preview
-  Fast oracle with 1M token context
+  Gemini 3 Flash Preview — fast, large context
 
-- gemini-2.5-pro
-  Stable reasoning model
+ORACLE USAGE:
+- Pass 'prompt' for text-only reasoning
+- Pass 'image_path' or 'image_base64' to include an image
+- Pass 'context' for large background text (paste code, docs, specs)
+- Pass 'system_instruction' to steer model behavior
+- Pass 'max_output_tokens' to control response length (default: {ORACLE_MAX_OUTPUT_TOKENS})
 
 Set GEMINI_API_KEY environment variable to use these models."""
         return [TextContent(type="text", text=models_info)]
@@ -319,6 +342,13 @@ Set GEMINI_API_KEY environment variable to use these models."""
         image_base64 = arguments.get("image_base64")
         image_mime_type = arguments.get("image_mime_type", "image/png")
         context = arguments.get("context")
+        system_instruction = arguments.get("system_instruction")
+        max_output_tokens = arguments.get("max_output_tokens")
+        if max_output_tokens is not None:
+            try:
+                max_output_tokens = int(max_output_tokens)
+            except (ValueError, TypeError):
+                max_output_tokens = None
         model = arguments.get("model", DEFAULT_ORACLE_MODEL)
 
         try:
@@ -332,6 +362,8 @@ Set GEMINI_API_KEY environment variable to use these models."""
                 image_bytes=image_bytes,
                 image_mime_type=image_mime_type,
                 context=context,
+                system_instruction=system_instruction,
+                max_output_tokens=max_output_tokens,
                 model=model,
             )
             return [TextContent(type="text", text=response_text)]

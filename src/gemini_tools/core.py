@@ -17,30 +17,43 @@ except ImportError:
 
 
 DEFAULT_IMAGE_MODEL = "gemini-3-pro-image-preview"
-DEFAULT_ORACLE_MODEL = "gemini-3.1-pro-preview"
+DEFAULT_ORACLE_MODEL = "gemini-2.5-pro"
+
+# Max output tokens for oracle responses — Gemini 2.5 Pro supports up to 65536.
+# Set high to allow large responses for complex tasks (code review, SVG gen, etc.).
+ORACLE_MAX_OUTPUT_TOKENS = 65536
 
 
 def load_dotenv(env_path: Path | str | None = None):
     """Load environment variables from a .env file.
 
     Args:
-        env_path: Path to .env file. If None, looks in current directory.
+        env_path: Path to .env file. If None, searches cwd and common Rhode locations.
     """
-    if env_path is None:
-        env_path = Path.cwd() / ".env"
-    else:
-        env_path = Path(env_path)
+    def _load_file(p: Path) -> None:
+        if p.exists():
+            with open(p, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if line and not line.startswith("#") and "=" in line:
+                        key, _, value = line.partition("=")
+                        key = key.strip()
+                        value = value.strip().strip('"').strip("'")
+                        if key and key not in os.environ:
+                            os.environ[key] = value
 
-    if env_path.exists():
-        with open(env_path, "r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if line and not line.startswith("#") and "=" in line:
-                    key, _, value = line.partition("=")
-                    key = key.strip()
-                    value = value.strip().strip('"').strip("'")
-                    if key and key not in os.environ:
-                        os.environ[key] = value
+    if env_path is not None:
+        _load_file(Path(env_path))
+        return
+
+    # Search order: current directory, then common Rhode deployment locations
+    candidates = [
+        Path.cwd() / ".env",
+        Path(__file__).parents[4] / ".env",       # repo root if installed in-tree
+        Path.home() / "Code" / "Rhode" / ".env",  # Rhode project standard location
+    ]
+    for candidate in candidates:
+        _load_file(candidate)
 
 
 def _get_mime_type(path: str) -> str:
@@ -125,13 +138,15 @@ def oracle_call(
     image_bytes: bytes | None = None,
     image_mime_type: str = "image/png",
     context: str | None = None,
+    system_instruction: str | None = None,
+    max_output_tokens: int | None = None,
     model: str = DEFAULT_ORACLE_MODEL,
 ) -> str:
     """
     Send a reasoning request to Gemini and return the text response.
 
-    Supports optional image input (via path or raw bytes) and large context text
-    (up to ~1M tokens with gemini-3.1-pro-preview).
+    Supports optional image input (via path or raw bytes), large context text
+    (up to ~1M tokens with gemini-2.5-pro), and a system instruction.
 
     Args:
         prompt: Text prompt for the reasoning request.
@@ -140,7 +155,9 @@ def oracle_call(
         image_mime_type: MIME type of the image when using image_bytes.
         context: Additional context text prepended before the prompt.
                  Can be very large (up to ~1M tokens).
-        model: Gemini model ID to use (default: gemini-3.1-pro-preview).
+        system_instruction: Optional system-level instruction for the model.
+        max_output_tokens: Maximum tokens in the response (default: ORACLE_MAX_OUTPUT_TOKENS=65536).
+        model: Gemini model ID to use (default: gemini-2.5-pro).
 
     Returns:
         The text response from Gemini.
@@ -175,6 +192,21 @@ def oracle_call(
     # Add the main prompt
     contents.append(types.Part.from_text(text=prompt))
 
+    # Build generation config — always set max_output_tokens to allow large responses
+    gen_config_kwargs: dict = {
+        "max_output_tokens": max_output_tokens if max_output_tokens is not None else ORACLE_MAX_OUTPUT_TOKENS,
+    }
+    if system_instruction is not None:
+        gen_config_kwargs["system_instruction"] = system_instruction
+
+    gen_config = None
+    config_cls = getattr(types, "GenerateContentConfig", None)
+    if config_cls is not None:
+        try:
+            gen_config = config_cls(**gen_config_kwargs)
+        except Exception:
+            gen_config = None
+
     # Try direct parts list first, then wrapped in Content object
     attempts = [contents]
     try:
@@ -189,10 +221,13 @@ def oracle_call(
 
     for attempt_contents in attempts:
         try:
-            response = client.models.generate_content(
-                model=model,
-                contents=attempt_contents,
-            )
+            call_kwargs: dict = {
+                "model": model,
+                "contents": attempt_contents,
+            }
+            if gen_config is not None:
+                call_kwargs["config"] = gen_config
+            response = client.models.generate_content(**call_kwargs)
             last_error = None
             break
         except Exception as e:
@@ -207,23 +242,42 @@ def oracle_call(
 
     # Extract text response
     candidate = response.candidates[0]
+
+    # Check finish reason — warn on truncation but still return partial content
+    finish_reason = getattr(candidate, "finish_reason", None)
+    finish_reason_str = str(finish_reason) if finish_reason is not None else ""
+
     parts = getattr(response, "parts", None)
     if parts is None and candidate.content:
         parts = candidate.content.parts
 
-    if not parts:
-        raise RuntimeError(f"No parts returned. Response: {response}")
-
+    # Collect whatever text was returned (may be partial on MAX_TOKENS)
     text_parts = []
-    for part in parts:
-        text = getattr(part, "text", None)
-        if text:
-            text_parts.append(text)
+    if parts:
+        for part in parts:
+            text = getattr(part, "text", None)
+            if text:
+                text_parts.append(text)
 
     if not text_parts:
-        raise RuntimeError(f"No text found in response. Response: {response}")
+        # Gemini 2.5 Pro uses thinking tokens — if max_output_tokens is too low,
+        # the model exhausts the budget on internal reasoning with nothing left for output.
+        if "MAX_TOKENS" in finish_reason_str:
+            raise RuntimeError(
+                "Response was empty: max_output_tokens budget was fully consumed by model "
+                "thinking before any output could be produced. Increase max_output_tokens "
+                f"(current effective limit caused {finish_reason_str})."
+            )
+        reason_hint = f" (finish_reason={finish_reason_str})" if finish_reason_str else ""
+        raise RuntimeError(f"No text found in response{reason_hint}. Response: {response}")
 
-    return "\n".join(text_parts)
+    result = "\n".join(text_parts)
+
+    # Append a truncation notice if response was cut off
+    if "MAX_TOKENS" in finish_reason_str:
+        result += "\n\n[Note: Response was truncated at the max_output_tokens limit. Increase max_output_tokens if you need the full response.]"
+
+    return result
 
 
 def generate_image(
